@@ -8,12 +8,14 @@
 <meta name="theme-color" content="#000000">
 <title>AI姿势引导相机</title>
 <!--
-  AI姿势引导相机 · 原型 v0.1
+  AI姿势引导相机 · 原型 v0.2（新增：AI 场景分析）
   功能：MediaPipe 姿态 + 人脸朝向识别 → 目标轮廓叠加 → 实时匹配度 → 中文语音引导被拍者 → 对齐后自动快门
   依赖（首次运行需联网，之后浏览器会缓存）：
     - @mediapipe/tasks-vision 1.0.1（cdn.jsdelivr.net）
     - pose_landmarker_lite / full、face_landmarker 模型（storage.googleapis.com）
   使用：必须通过 HTTPS（或 localhost）打开，手机浏览器才允许调用摄像头。
+  AI 场景分析：在「设置 → AI 场景分析」里填 Gemini API Key，或 OpenAI 兼容接口（Qwen-VL / vLLM / Ollama），
+    或填自己的 Cloudflare Worker 代理地址（推荐，Key 不暴露在网页里）。每次分析只上传当前一帧画面。
 -->
 <style>
 :root{
@@ -63,6 +65,8 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 .chip img{width:40px;height:52px}
 .chip span{font-size:11px;line-height:1.2;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .chip.add span{color:var(--muted)}
+.chip.ai{background:linear-gradient(160deg,rgba(129,140,248,.35),rgba(236,72,153,.28))}
+.chip.ai span{color:#e0e7ff}
 #controls{display:flex;align-items:center;justify-content:space-around;padding:2px 20px 0}
 #shutter{width:74px;height:74px;border-radius:50%;border:4px solid #fff;display:flex;align-items:center;justify-content:center}
 #shutter i{display:block;width:58px;height:58px;border-radius:50%;background:#fff;transition:transform .1s}
@@ -115,6 +119,34 @@ input[type=range]{width:140px;accent-color:var(--accent)}
 #galActions{display:flex;gap:10px;padding:0 14px 8px}
 #galActions button{flex:1;padding:12px;border-radius:12px;background:var(--chip);font-size:15px}
 
+/* AI 场景分析 */
+#aiRow{display:flex;justify-content:center;padding:0 12px 6px}
+#aiBtn{display:flex;align-items:center;gap:6px;padding:8px 16px;border-radius:20px;font-size:14px;font-weight:700;
+  background:linear-gradient(135deg,rgba(129,140,248,.9),rgba(236,72,153,.85));box-shadow:0 2px 10px rgba(0,0,0,.35)}
+#aiBtn svg{width:18px;height:18px}
+#aiBtn:disabled{opacity:.55}
+#aiBusy{position:absolute;inset:0;z-index:35;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+#aiBusy.open{display:flex}
+#aiBusy img{width:46%;max-width:240px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+.spin{width:34px;height:34px;border-radius:50%;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;animation:sp 0.9s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+#aiBusy .t{font-size:16px;font-weight:600}
+#aiBusy button{padding:8px 22px;border-radius:18px;background:var(--chip);font-size:14px}
+.scene{background:rgba(255,255,255,.06);border-radius:12px;padding:10px 12px;font-size:14px;line-height:1.55;margin-bottom:10px}
+.scene b{color:#fff}
+.scene .warn{color:var(--warn);font-size:13px}
+.cand{display:flex;gap:10px;align-items:flex-start;background:rgba(255,255,255,.06);border-radius:12px;padding:10px;margin-bottom:8px;border:2px solid transparent;width:100%;text-align:left}
+.cand.on{border-color:var(--accent)}
+.cand img{width:44px;height:58px;flex:none;border-radius:8px;background:rgba(255,255,255,.08)}
+.cand .n{font-size:15px;font-weight:700}
+.cand .r{font-size:12px;color:var(--muted);margin-top:2px}
+.cand .s{font-size:13px;margin-top:4px}
+.cand .p{font-size:12px;color:#a5b4fc;margin-top:2px}
+.meta{font-size:11px;color:var(--muted);text-align:right}
+.field{display:flex;flex-direction:column;gap:4px;padding:8px 0;font-size:13px;color:var(--muted)}
+.field input,.field select{font:inherit;font-size:15px;color:#fff;background:rgba(255,255,255,.08);border:1px solid var(--line);border-radius:9px;padding:9px 10px;width:100%;-webkit-user-select:text;user-select:text}
+.secTitle{font-size:13px;color:var(--accent);font-weight:700;margin:16px 0 2px;letter-spacing:.5px}
+.hint{font-size:12px;color:var(--muted);line-height:1.5;padding:4px 0}
 #toast{position:absolute;left:50%;top:calc(80px + var(--safe-t));transform:translateX(-50%);background:var(--panel);padding:8px 14px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;max-width:88%;text-align:center}
 #toast.show{opacity:1}
 #dbgBox{position:absolute;right:10px;bottom:calc(190px + var(--safe-b));font:11px/1.35 ui-monospace,Menlo,monospace;color:rgba(255,255,255,.75);text-align:right;text-shadow:0 1px 2px #000;pointer-events:none;white-space:pre}
@@ -145,6 +177,7 @@ input[type=range]{width:140px;accent-color:var(--accent)}
   <div id="guide"><div id="msgMain">正在准备…</div><div id="msgSub"></div></div>
 
   <div id="bottom">
+    <div id="aiRow"><button id="aiBtn"><svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9z"/><path d="M19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9z"/></svg>AI 场景分析</button></div>
     <div id="chips"></div>
     <div id="controls">
       <button id="thumbBtn" title="相册"></button>
@@ -167,12 +200,27 @@ input[type=range]{width:140px;accent-color:var(--accent)}
       <div class="seg" id="segModel"><button data-v="lite">快速</button><button data-v="full">标准</button></div></div>
     <div class="row"><div>显示骨架与辅助线</div><div class="sw" id="swSkel"></div></div>
     <div class="row"><div>调试信息<small>帧率与各项分数</small></div><div class="sw" id="swDbg"></div></div>
+    <div class="secTitle">AI 场景分析</div>
+    <div class="row"><div>服务类型</div>
+      <div class="seg" id="segProv"><button data-v="gemini">Gemini</button><button data-v="openai">OpenAI 兼容</button></div></div>
+    <label class="field">接口地址（留空=官方；填 Worker 代理地址则可不填 Key）<input id="aiBase" placeholder="https://generativelanguage.googleapis.com" autocomplete="off" spellcheck="false"></label>
+    <label class="field">API Key（只保存在本机浏览器）<input id="aiKey" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false"></label>
+    <label class="field">模型<input id="aiModel" list="aiModels" autocomplete="off" spellcheck="false"><datalist id="aiModels"></datalist></label>
+    <div class="hint" id="aiHint"></div>
+    <div class="btnRow" style="padding-top:6px"><button class="btn" id="aiTest">测试连接</button></div>
+    <div class="secTitle">模板</div>
     <div class="btnRow">
       <button class="btn" id="importBtn">从照片导入姿势</button>
       <button class="btn" id="saveCurBtn">当前姿势存为模板</button>
       <button class="btn danger" id="delTplBtn">删除当前自定义模板</button>
     </div>
     <input type="file" id="fileIn" accept="image/*" hidden>
+  </div>
+
+  <div id="aiBusy"><img id="aiShot" alt=""><div class="spin"></div><div class="t" id="aiBusyTxt">AI 正在看场景…</div><button id="aiCancel">取消</button></div>
+  <div class="sheet" id="aiSheet">
+    <h3>AI 场景分析 <button id="aiClose">完成</button></h3>
+    <div id="aiBody"></div>
   </div>
 
   <div id="gallery">
@@ -262,6 +310,8 @@ const BUILTIN = [
     arms:[14,-12,14,-12], legs:[-10,-16,3,2]},
   {id:'gaze', name:'眺望远方', tip:'双手背后，头转向左边看远处', yaw:20, face:45, target:{cx:.36,cy:.47,h:.56},
     arms:[6,-25,6,-25], legs:[8,2,2,1]},
+  {id:'lean', name:'倚靠', tip:'肩膀轻靠墙或柱子，双腿交叉，一手叉腰', yaw:35, face:10, lean:6, target:{cx:.40,cy:.47,h:.56},
+    arms:[5,-15,25,-60], legs:[-8,-12,4,2]},
   {id:'walk', name:'迈步走', tip:'身体微侧，左脚向前迈一步', yaw:35, face:0, target:{cx:.5,cy:.47,h:.56},
     arms:[-8,-10,14,20], legs:[14,2,-6,-2]},
 ];
@@ -271,7 +321,7 @@ function buildTemplate(t){
 }
 let templates = BUILTIN.map(buildTemplate);
 let custom = store.get('custom', []);
-function allTemplates(){ return templates.concat(custom); }
+function allTemplates(){ return aiTpls.concat(templates, custom); }
 
 /* ====================== 状态 ====================== */
 const S = {
@@ -759,7 +809,7 @@ function tplIcon(t){
 function renderChips(){
   const box=$('chips'); box.innerHTML='';
   for(const t of allTemplates()){
-    const b=document.createElement('button'); b.className='chip'+(t.id===S.tplId?' active':'');
+    const b=document.createElement('button'); b.className='chip'+(t.id===S.tplId?' active':'')+(t.ai?' ai':'');
     b.innerHTML=`<img alt="" src="${t._icon||(t._icon=tplIcon(t))}"><span>${t.name}</span>`;
     b.onclick=()=>selectTpl(t.id);
     box.appendChild(b);
@@ -771,7 +821,7 @@ function renderChips(){
   const act=box.querySelector('.chip.active'); act && act.scrollIntoView({inline:'center', block:'nearest'});
 }
 function selectTpl(id){
-  S.tplId=id; store.set('tplId',id);
+  S.tplId=id; if(!String(id).startsWith('ai')) store.set('tplId',id);
   const t=curTpl();
   $('tplName').textContent=t.name; $('tplSub').textContent=t.tip||'';
   renderChips();
@@ -843,6 +893,304 @@ async function sharePhoto(){
   const a=document.createElement('a'); a.href=p.url; a.download=p.name; document.body.appendChild(a); a.click(); a.remove();
 }
 
+/* ====================== AI 场景分析（一次性 VLM 调用） ====================== */
+const AI_DEFAULT = {
+  prov:'gemini',
+  gemini:{base:'', key:'', model:'gemini-3.5-flash-lite'},
+  openai:{base:'', key:'', model:'qwen3-vl-plus'},
+};
+const AI_MODELS = {
+  gemini:['gemini-3.5-flash-lite','gemini-3.1-flash-lite','gemini-3.6-flash','gemini-3.8-flash'],
+  openai:['qwen3-vl-plus','qwen3-vl-flash','qwen-vl-max','qwen3-vl:8b','Qwen/Qwen3-VL-8B-Instruct'],
+};
+let AI = Object.assign({}, AI_DEFAULT, store.get('ai', {}));
+AI.gemini = Object.assign({}, AI_DEFAULT.gemini, AI.gemini); AI.openai = Object.assign({}, AI_DEFAULT.openai, AI.openai);
+let aiTpls = [];      // 本次分析生成的临时模板
+let aiLast = null;    // 最近一次分析结果
+let aiAbort = null;
+
+const LIGHT_ZH = {left:'光从画面左侧来', right:'光从画面右侧来', front:'顺光（光照向被拍者正面）', back:'逆光', top:'顶光', soft:'柔和散射光', mixed:'混合光'};
+const CAM_ZH = {eye:'与眼睛同高', chest:'胸口高度', waist:'腰部高度', low:'低机位（蹲下仰拍）', high:'高机位（举高俯拍）'};
+
+// 发给模型的 JSON Schema（Gemini 结构化输出用；OpenAI 兼容接口则写进提示词）
+function aiSchema(){
+  const ids = BUILTIN.map(t=>t.id).concat(['custom']);
+  const num = {type:'number'};
+  return {
+    type:'object',
+    properties:{
+      scene:{type:'object', properties:{
+        type:{type:'string'}, summary:{type:'string'},
+        light_dir:{type:'string', enum:['left','right','front','back','top','soft','mixed']},
+        warnings:{type:'array', items:{type:'string'}}
+      }, required:['type','summary','light_dir']},
+      camera:{type:'object', properties:{
+        height:{type:'string', enum:['eye','chest','waist','low','high']}, advice:{type:'string'}
+      }, required:['height','advice']},
+      candidates:{type:'array', minItems:1, maxItems:3, items:{type:'object', properties:{
+        name:{type:'string'},
+        template_id:{type:'string', enum:ids},
+        custom_pose:{type:'object', properties:{
+          arms:{type:'array', items:num, minItems:4, maxItems:4},
+          legs:{type:'array', items:num, minItems:4, maxItems:4},
+          lean:num }},
+        target:{type:'object', properties:{cx:num, cy:num, h:num}, required:['cx','cy','h']},
+        body_yaw:num, face_yaw:num,
+        tips_subject:{type:'string'}, tips_photographer:{type:'string'}, reason:{type:'string'}
+      }, required:['name','template_id','target','body_yaw','face_yaw','tips_subject','tips_photographer','reason']}}
+    },
+    required:['scene','camera','candidates']
+  };
+}
+
+function aiPrompt(frame, person){
+  const tplList = BUILTIN.map(t=>`- ${t.id}：${t.name}（${t.tip}）`).join('\n');
+  const who = person
+    ? `画面中已检测到被拍者，其"鼻子到脚踝"身体框当前中心约 (${person.cx.toFixed(2)}, ${person.cy.toFixed(2)})，高度占比约 ${person.h.toFixed(2)}。`
+    : '画面中目前没有检测到人，请根据场景规划被拍者应该站在哪里。';
+  return `你是一位专业的人像摄影指导。下面是手机相机的取景画面（宽 ${frame.w} × 高 ${frame.h}）。
+请为 1 位被拍者规划：站在画面哪里、身体和脸朝哪边、摆什么姿势，让照片更好看。${who}
+
+【坐标】以这张图片为准：x 从左 0 到右 1，y 从上 0 到下 1。
+【target】被拍者"鼻子到脚踝"身体框在画面中的中心 cx、cy 和高度占比 h。全身照 h 一般 0.35–0.60。
+  框上沿 cy-h/2 ≥ 0.12，框下沿 cy+h/2 ≤ 0.80（画面底部有按钮遮挡）。
+【站位原则】脚必须落在可以站人的地面上（不能悬空、不能在水里或车道上）；优先放在三分线附近；
+  脸朝向的一侧多留空间；头部背后避开电线杆、树干、杂物，不要让东西从头顶"长出来"；
+  善用墙、栏杆、门框、植物、引导线；尽量让脸朝向光源，避免强逆光（除非刻意拍剪影）。
+【朝向】单位：度，以镜头为参照。0 = 正对镜头；正值 = 身体正面转向画面右侧；负值 = 转向画面左侧；±90 = 完全侧身。
+  body_yaw 是身体朝向，face_yaw 是脸的朝向。
+【姿势】优先从下面的模板里选 template_id：
+${tplList}
+  如果场景更适合模板里没有的站姿（例如一只手扶栏杆、手放在墙上），用 template_id = "custom"，并给出 custom_pose：
+  arms = [左上臂, 左小臂, 右上臂, 右小臂]，legs = [左大腿, 左小腿, 右大腿, 右小腿]，单位：度。
+  0 = 竖直向下；正值 = 向身体外侧抬起（90 = 水平伸出，180 = 举过头顶）；负值 = 向身体内侧收（叉腰时小臂约 -45）。
+  "左/右"指被拍者自己的左右（面对镜头时，他的左侧出现在画面右侧）。lean = 上身倾斜角，正值 = 向画面右侧倾。
+  目前只支持站姿，不要推荐坐、蹲、躺。
+【文字】全部用简体中文：
+  tips_subject：对被拍者说的一句话，口语化，≤30 字，会用语音播报；
+  tips_photographer：给拍摄者的建议（手机高度、俯仰、用广角还是长焦），≤30 字；
+  reason：为什么这样安排，≤30 字；name：方案名，≤6 字。
+  scene.type：场景类型（如 海边、街道、咖啡馆、公园、室内、夜景）；scene.summary：≤40 字；
+  scene.light_dir：left/right/front/back/top/soft/mixed（以画面为参照，front = 光从拍摄者身后照向被拍者）；
+  scene.warnings：最多 3 条需要注意的问题（如 逆光、背景杂乱、地平线歪），没有就给空数组；
+  camera.height：eye/chest/waist/low/high；camera.advice：≤30 字。
+【数量】给 2–3 个差异明显的方案，按推荐程度排序。
+
+只输出一个 JSON 对象，不要任何其它文字。格式示例：
+{"scene":{"type":"公园","summary":"…","light_dir":"left","warnings":[]},"camera":{"height":"chest","advice":"…"},
+ "candidates":[{"name":"…","template_id":"hip1","target":{"cx":0.36,"cy":0.47,"h":0.52},"body_yaw":25,"face_yaw":10,
+ "tips_subject":"…","tips_photographer":"…","reason":"…"}]}`;
+}
+
+function grabFrame(maxSide=768){
+  const C=crop();
+  const k=Math.min(1, maxSide/Math.max(C.sw,C.sh));
+  const c=document.createElement('canvas'); c.width=Math.round(C.sw*k); c.height=Math.round(C.sh*k);
+  c.getContext('2d').drawImage(vid, C.sx, C.sy, C.sw, C.sh, 0,0, c.width, c.height);   // 不镜像，坐标与识别一致
+  const dataUrl=c.toDataURL('image/jpeg', 0.8);
+  return {dataUrl, b64:dataUrl.split(',')[1], w:c.width, h:c.height};
+}
+
+function aiErr(status, text){
+  const t=(text||'').slice(0,160);
+  if(status===400) return '请求被拒绝（400）：模型可能不支持图片或参数。'+t;
+  if(status===401||status===403) return 'API Key 无效或没有权限（'+status+'）';
+  if(status===404) return '找不到模型或接口地址（404），请检查模型名和地址';
+  if(status===429) return '请求太频繁或免费额度已用完（429），稍后再试';
+  return `服务出错（${status}）：${t}`;
+}
+async function postJSON(url, headers, body, signal){
+  let r;
+  try{ r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json', ...headers}, body:JSON.stringify(body), signal}); }
+  catch(e){ if(e.name==='AbortError') throw e; throw new Error('网络不通，或被浏览器跨域拦截。Qwen 官方接口请通过 Worker 代理调用。'); }
+  const text = await r.text();
+  if(!r.ok){
+    let status=r.status, msg=text;
+    try{ const j=JSON.parse(text); msg=(j.error&&(j.error.message||j.error))||text; }catch(e){}
+    if(/API_KEY_INVALID|API key not valid|invalid.?api.?key|Incorrect API key/i.test(text)) status=401;   // Gemini 的 Key 错误返回 400
+    const err=new Error(aiErr(status, typeof msg==='string'?msg:JSON.stringify(msg))); err.status=status; throw err;
+  }
+  try{ return JSON.parse(text); }catch(e){ throw new Error('服务返回的不是 JSON'); }
+}
+
+async function callGemini(prompt, frame, signal){
+  const cfg=AI.gemini;
+  const base=(cfg.base||'https://generativelanguage.googleapis.com').replace(/\/+$/,'');
+  const url=`${base}/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent`;
+  const headers = cfg.key? {'x-goog-api-key':cfg.key} : {};
+  const parts=[{text:prompt}];
+  if(frame) parts.push({inlineData:{mimeType:'image/jpeg', data:frame.b64}});
+  const gc = {responseMimeType:'application/json', responseJsonSchema: frame? aiSchema() : undefined, thinkingConfig:{thinkingLevel:'low'}, maxOutputTokens:4096};
+  // 不同模型支持的参数不同：400 时逐步去掉可选参数再试
+  const tries=[gc, {...gc, thinkingConfig:undefined}, {responseMimeType:'application/json', maxOutputTokens:4096}];
+  let lastErr;
+  for(const g of tries){
+    try{
+      const d=await postJSON(url, headers, {contents:[{role:'user', parts}], generationConfig:JSON.parse(JSON.stringify(g))}, signal);
+      const ps=(d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts)||[];
+      const txt=ps.filter(p=>p.text && !p.thought).map(p=>p.text).join('');
+      if(!txt){ const why=(d.candidates&&d.candidates[0]&&d.candidates[0].finishReason)||(d.promptFeedback&&d.promptFeedback.blockReason)||'空结果'; throw new Error('模型没有返回内容：'+why); }
+      return {text:txt, usage:d.usageMetadata};
+    }catch(e){ lastErr=e; if(e.status!==400) throw e; }
+  }
+  throw lastErr;
+}
+
+async function callOpenAI(prompt, frame, signal){
+  const cfg=AI.openai;
+  if(!cfg.base) throw new Error('请先在设置里填写 OpenAI 兼容接口地址');
+  const url=cfg.base.replace(/\/+$/,'')+'/chat/completions';
+  const headers = cfg.key? {'Authorization':'Bearer '+cfg.key} : {};
+  const content=[];
+  if(frame) content.push({type:'image_url', image_url:{url:frame.dataUrl}});
+  content.push({type:'text', text:prompt});
+  const body={model:cfg.model, messages:[{role:'user', content}], response_format:{type:'json_object'}, temperature:0.5, max_tokens:2000};
+  const tries=[body, {...body, response_format:undefined}];
+  let lastErr;
+  for(const b of tries){
+    try{
+      const d=await postJSON(url, headers, JSON.parse(JSON.stringify(b)), signal);
+      const m=d.choices&&d.choices[0]&&d.choices[0].message;
+      let txt=m&&m.content; if(Array.isArray(txt)) txt=txt.map(x=>x.text||'').join('');
+      if(!txt) throw new Error('模型没有返回内容');
+      return {text:txt, usage:d.usage};
+    }catch(e){ lastErr=e; if(e.status!==400) throw e; }
+  }
+  throw lastErr;
+}
+
+function parseLooseJSON(txt){
+  let t=String(txt).trim().replace(/^```(?:json)?\s*/i,'').replace(/```\s*$/,'');
+  try{ return JSON.parse(t); }catch(e){}
+  const a=t.indexOf('{'), b=t.lastIndexOf('}');
+  if(a>=0&&b>a){ try{ return JSON.parse(t.slice(a,b+1)); }catch(e){} }
+  throw new Error('模型输出不是合法 JSON');
+}
+
+// 端侧校正：把模型输出限制在合理范围内，避免"说得好听但坐标离谱"
+function normalizeAI(raw){
+  const num=(v,d)=>{ const n=Number(v); return Number.isFinite(n)?n:d; };
+  let cands=(Array.isArray(raw.candidates)?raw.candidates:[]);
+  // 模板不存在、又没给自定义姿势的方案丢掉（例如模型推荐了"坐姿"）
+  const okC=cands.filter(c=>BUILTIN.some(t=>t.id===c.template_id) || (c.custom_pose&&Array.isArray(c.custom_pose.arms)&&Array.isArray(c.custom_pose.legs)));
+  if(okC.length) cands=okC;
+  cands=cands.slice(0,3);
+  if(!cands.length) throw new Error('模型没有给出站位方案');
+  const out=cands.map((c,i)=>{
+    const base = BUILTIN.find(t=>t.id===c.template_id);
+    let arms, legs, lean=0;
+    const cp=c.custom_pose;
+    if((c.template_id==='custom'||!base) && cp && Array.isArray(cp.arms)&&cp.arms.length===4&&Array.isArray(cp.legs)&&cp.legs.length===4){
+      arms=cp.arms.map(v=>clamp(num(v,5),-170,180)); legs=cp.legs.map(v=>clamp(num(v,3),-40,70));
+      lean=-clamp(num(cp.lean,0),-20,20);   // 内部 lean 正值 = 上身向画面左倾，与提示词定义相反
+    }else{
+      const b=base||BUILTIN[0]; arms=b.arms.slice(); legs=b.legs.slice(); lean=b.lean||0;
+    }
+    const tg=c.target||{};
+    let h=clamp(num(tg.h,.5),.25,.68);
+    const cy=clamp(num(tg.cy,.47), .12+h/2, .80-h/2);
+    const cx=clamp(num(tg.cx,.5), .12, .88);
+    const yaw=Math.round(clamp(wrap180(num(c.body_yaw, base?base.yaw:0)),-90,90));
+    const face=Math.round(clamp(wrap180(num(c.face_yaw, base?base.face:0)),-80,80));
+    const name=String(c.name||(base&&base.name)||'方案').slice(0,8);
+    return buildTemplate({id:'ai'+(i+1), name:'AI·'+name, tip:String(c.tips_subject||'').slice(0,60),
+      ptip:String(c.tips_photographer||'').slice(0,60), reason:String(c.reason||'').slice(0,60),
+      base:c.template_id, yaw, face, lean, target:{cx,cy,h}, arms, legs, ai:true});
+  });
+  const sc=raw.scene||{}, cam=raw.camera||{};
+  return {scene:{type:String(sc.type||'场景'), summary:String(sc.summary||''), light:sc.light_dir,
+            warnings:(Array.isArray(sc.warnings)?sc.warnings:[]).slice(0,3).map(String)},
+          camera:{height:cam.height, advice:String(cam.advice||'')}, cands:out};
+}
+
+async function analyzeScene(){
+  if(!vid.videoWidth){ toast('相机还没准备好'); return; }
+  const cfg=AI[AI.prov];
+  if(AI.prov==='gemini' && !cfg.key && !cfg.base){ toast('请先填写 Gemini API Key'); openSheet(true); return; }
+  if(AI.prov==='openai' && !cfg.base){ toast('请先填写接口地址'); openSheet(true); return; }
+  if(!store.get('aiConsent',false)){
+    if(!confirm('AI 场景分析会把当前一帧画面（约 768 像素）发送给你设置的 AI 服务进行分析，不会保存在本应用中。继续吗？')) return;
+    store.set('aiConsent',true);
+  }
+  const frame=grabFrame(768);
+  const E=S.E, person = (S.lm && E && E.cb)? {cx:E.cb.cx/W, cy:E.cb.cy/H, h:E.cb.h/H} : null;
+  $('aiShot').src=frame.dataUrl; $('aiBusyTxt').textContent='AI 正在看场景…'; $('aiBusy').classList.add('open'); $('aiBtn').disabled=true;
+  Voice.speak('正在分析场景，请稍等', true);
+  aiAbort=new AbortController(); const to=setTimeout(()=>aiAbort.abort(), 45000);
+  const t0=performance.now();
+  try{
+    const prompt=aiPrompt(frame, person);
+    const res = AI.prov==='gemini'? await callGemini(prompt, frame, aiAbort.signal) : await callOpenAI(prompt, frame, aiAbort.signal);
+    const parsed=normalizeAI(parseLooseJSON(res.text));
+    parsed.ms=Math.round(performance.now()-t0); parsed.model=AI[AI.prov].model; parsed.usage=res.usage; parsed.shot=frame.dataUrl;
+    aiLast=parsed; aiTpls=parsed.cands;
+    renderChips(); showAISheet(); applyAI(0, false);
+    const n=parsed.cands.length;
+    Voice.speak(`分析完成，${parsed.scene.type}，推荐${n}个方案。第一个：${parsed.cands[0].name.replace('AI·','')}。${parsed.cands[0].tip}`, true);
+  }catch(e){
+    console.error(e);
+    toast(e.name==='AbortError'? '已取消（或超过 45 秒没有响应）' : ('分析失败：'+e.message));
+  }finally{
+    clearTimeout(to); aiAbort=null; $('aiBusy').classList.remove('open'); $('aiBtn').disabled=false;
+  }
+}
+
+function applyAI(i, speak=true){
+  const t=aiTpls[i]; if(!t) return;
+  S.tplId=t.id; store.set('tplId','stand');  // AI 模板是临时的，不记住
+  $('tplName').textContent=t.name; $('tplSub').textContent=t.tip||'';
+  S.shutterState='idle'; S.armed=true; $('countRing').style.display='none'; Voice.lastMsg='';
+  renderChips();
+  document.querySelectorAll('#aiBody .cand').forEach((el,k)=>el.classList.toggle('on',k===i));
+  if(speak) Voice.speak(`${t.name.replace('AI·','')}。${t.tip}`, true);
+  if(t.ptip) setTimeout(()=>toast('拍摄者：'+t.ptip), speak?0:300);
+}
+
+function showAISheet(){
+  const r=aiLast; if(!r) return;
+  const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  let h=`<div class="scene"><b>${esc(r.scene.type)}</b> · ${esc(LIGHT_ZH[r.scene.light]||r.scene.light||'')}<br>${esc(r.scene.summary)}`;
+  if(r.scene.warnings.length) h+=`<div class="warn">⚠ ${r.scene.warnings.map(esc).join('　⚠ ')}</div>`;
+  h+=`<div>📷 ${esc(CAM_ZH[r.camera.height]||'')}${r.camera.advice?'，'+esc(r.camera.advice):''}</div></div>`;
+  r.cands.forEach((t,i)=>{
+    h+=`<button class="cand${t.id===S.tplId?' on':''}" data-i="${i}"><img alt="" src="${t._icon||(t._icon=tplIcon(t))}"><div>
+      <div class="n">${i+1}. ${esc(t.name.replace('AI·',''))}</div>
+      <div class="r">${esc(t.reason)}</div>
+      <div class="s">🗣 ${esc(t.tip)}</div>
+      <div class="p">📱 ${esc(t.ptip)}</div></div></button>`;
+  });
+  const tok=r.usage? (r.usage.totalTokenCount||r.usage.total_tokens||''):'';
+  h+=`<div class="meta">${esc(r.model)} · ${(r.ms/1000).toFixed(1)} 秒${tok?' · '+tok+' tokens':''}</div>`;
+  $('aiBody').innerHTML=h;
+  $('aiBody').querySelectorAll('.cand').forEach(el=>el.onclick=()=>{ applyAI(+el.dataset.i); closeAISheet(); });
+  $('aiSheet').classList.add('open'); $('mask').classList.add('open');
+}
+function closeAISheet(){ $('aiSheet').classList.remove('open'); $('mask').classList.remove('open'); }
+
+async function testAI(){
+  const btn=$('aiTest'); btn.disabled=true; btn.textContent='测试中…';
+  const t0=performance.now();
+  try{
+    const p='只回复这个 JSON：{"ok":true}';
+    const r = AI.prov==='gemini'? await callGemini(p, null) : await callOpenAI(p, null);
+    const j=parseLooseJSON(r.text);
+    toast(j.ok? `连接成功（${((performance.now()-t0)/1000).toFixed(1)} 秒）` : '已连通，但返回内容异常');
+  }catch(e){ toast('连接失败：'+e.message); }
+  finally{ btn.disabled=false; btn.textContent='测试连接'; }
+}
+
+function syncAIUI(){
+  for(const b of $('segProv').children) b.classList.toggle('on', b.dataset.v===AI.prov);
+  const c=AI[AI.prov];
+  $('aiBase').value=c.base; $('aiKey').value=c.key; $('aiModel').value=c.model;
+  $('aiBase').placeholder = AI.prov==='gemini'? 'https://generativelanguage.googleapis.com' : 'https://…/compatible-mode/v1';
+  $('aiModels').innerHTML=AI_MODELS[AI.prov].map(m=>`<option value="${m}">`).join('');
+  $('aiHint').innerHTML = AI.prov==='gemini'
+    ? 'Key 在 aistudio.google.com 免费申请。推荐 Flash-Lite（快、便宜），要效果更好换 gemini-3.6-flash。'
+    : '阿里云百炼（Qwen-VL）新加坡区地址：https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1；浏览器直连可能被跨域拦截，建议走 Worker 代理。<br>自部署：vLLM / Ollama（qwen3-vl:8b）需配 HTTPS 地址，手机网页无法调用 http 地址。';
+}
+function saveAI(){ store.set('ai', AI); }
+
 /* ====================== UI 绑定 ====================== */
 let toastT=0;
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),2200); }
@@ -866,9 +1214,15 @@ $('swDbg').onclick=()=>toggle('dbg');
 $('thr').oninput=e=>{ S.thr=+e.target.value; store.set('thr',S.thr); $('thrVal').textContent=S.thr; };
 $('segMove').onclick=e=>{ const v=e.target.dataset.v; if(!v) return; S.moveMode=v; store.set('moveMode',v); syncUI(); };
 $('segModel').onclick=e=>{ const v=e.target.dataset.v; if(!v) return; switchModel(v).then(syncUI); syncUI(); };
-const openSheet=()=>{ $('settings').classList.add('open'); $('mask').classList.add('open'); };
-const closeSheet=()=>{ $('settings').classList.remove('open'); $('mask').classList.remove('open'); };
-$('setBtn').onclick=openSheet; $('setClose').onclick=closeSheet; $('mask').onclick=closeSheet;
+const openSheet=(toAI)=>{ $('settings').classList.add('open'); $('mask').classList.add('open'); if(toAI===true) setTimeout(()=>$('segProv').scrollIntoView({block:'center'}),260); };
+const closeSheet=()=>{ $('settings').classList.remove('open'); closeAISheet(); };
+$('setBtn').onclick=()=>openSheet();
+$('aiBtn').onclick=analyzeScene;
+$('aiCancel').onclick=()=>{ aiAbort&&aiAbort.abort(); };
+$('aiClose').onclick=closeAISheet;
+$('segProv').onclick=e=>{ const v=e.target.dataset.v; if(!v) return; AI.prov=v; saveAI(); syncAIUI(); };
+for(const [id,k] of [['aiBase','base'],['aiKey','key'],['aiModel','model']]) $(id).addEventListener('input',e=>{ AI[AI.prov][k]=e.target.value.trim(); saveAI(); });
+$('aiTest').onclick=testAI; $('setClose').onclick=closeSheet; $('mask').onclick=closeSheet;
 $('importBtn').onclick=()=>$('fileIn').click();
 $('fileIn').onchange=e=>{ const f=e.target.files[0]; e.target.value=''; if(f){ closeSheet(); importPhoto(f); } };
 $('saveCurBtn').onclick=()=>{ closeSheet(); saveCurrent(); };
@@ -905,10 +1259,10 @@ $('startBtn').onclick=async()=>{
   }
 };
 
-syncUI();
+syncUI(); syncAIUI();
 { const t=curTpl(); $('tplName').textContent=t.name; $('tplSub').textContent=t.tip; }
 renderChips();
-window.__posecam = {S, evaluate, guidance, placeTemplate, allTemplates, capture};
+window.__posecam = {S, evaluate, guidance, placeTemplate, allTemplates, capture, AI, normalizeAI, parseLooseJSON, aiPrompt, analyzeScene};
 </script>
 </body>
 </html>
