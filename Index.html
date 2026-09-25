@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>AI姿势引导相机</title>
+<!--
+  AI姿势引导相机 · 原型 v0.1
+  功能：MediaPipe 姿态 + 人脸朝向识别 → 目标轮廓叠加 → 实时匹配度 → 中文语音引导被拍者 → 对齐后自动快门
+  依赖（首次运行需联网，之后浏览器会缓存）：
+    - @mediapipe/tasks-vision 1.0.1（cdn.jsdelivr.net）
+    - pose_landmarker_lite / full、face_landmarker 模型（storage.googleapis.com）
+  使用：必须通过 HTTPS（或 localhost）打开，手机浏览器才允许调用摄像头。
+-->
+<style>
+:root{
+  --bg:#000; --fg:#fff; --muted:rgba(255,255,255,.72); --panel:rgba(20,20,24,.78);
+  --line:rgba(255,255,255,.16); --accent:#34d399; --warn:#fbbf24; --bad:#f87171; --chip:rgba(255,255,255,.12);
+  --safe-b:env(safe-area-inset-bottom,0px); --safe-t:env(safe-area-inset-top,0px);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+  touch-action:manipulation;user-select:none;-webkit-user-select:none}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+#app{position:fixed;inset:0}
+#cv{position:absolute;inset:0;width:100%;height:100%;display:block;background:#000}
+#vid{position:absolute;width:2px;height:2px;opacity:0;pointer-events:none;left:0;top:0}
+
+/* 顶栏 */
+#top{position:absolute;left:0;right:0;top:0;padding:calc(10px + var(--safe-t)) 12px 8px;display:flex;align-items:center;gap:10px;
+  background:linear-gradient(rgba(0,0,0,.55),rgba(0,0,0,0))}
+#scoreWrap{position:relative;width:58px;height:58px;flex:none}
+#scoreWrap svg{position:absolute;inset:0;transform:rotate(-90deg)}
+#scoreNum{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+#tplInfo{flex:1;min-width:0}
+#tplName{font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#tplSub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.iconBtn{width:42px;height:42px;border-radius:21px;background:var(--chip);display:flex;align-items:center;justify-content:center;flex:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.iconBtn svg{width:22px;height:22px}
+.iconBtn.off{opacity:.45}
+
+/* 指令区 */
+#guide{position:absolute;left:12px;right:12px;top:calc(78px + var(--safe-t));display:flex;flex-direction:column;align-items:center;gap:6px;pointer-events:none}
+#msgMain{max-width:100%;padding:10px 16px;border-radius:14px;background:var(--panel);font-size:20px;font-weight:700;text-align:center;line-height:1.35;
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:background .2s}
+#msgMain.ok{background:rgba(16,120,80,.85)}
+#msgSub{font-size:13px;color:var(--muted);text-align:center;text-shadow:0 1px 3px #000;min-height:18px}
+#countRing{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);width:110px;height:110px;pointer-events:none;display:none}
+#countRing svg{transform:rotate(-90deg)}
+#countTxt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;text-shadow:0 1px 4px #000}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .35s}
+
+/* 底栏 */
+#bottom{position:absolute;left:0;right:0;bottom:0;padding:8px 0 calc(12px + var(--safe-b));background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.7) 30%)}
+#chips{display:flex;gap:8px;overflow-x:auto;padding:4px 12px 10px;scrollbar-width:none}
+#chips::-webkit-scrollbar{display:none}
+.chip{flex:none;width:68px;border-radius:12px;background:var(--chip);padding:6px 4px 5px;display:flex;flex-direction:column;align-items:center;gap:3px;border:2px solid transparent}
+.chip.active{border-color:var(--accent);background:rgba(52,211,153,.18)}
+.chip img{width:40px;height:52px}
+.chip span{font-size:11px;line-height:1.2;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.chip.add span{color:var(--muted)}
+#controls{display:flex;align-items:center;justify-content:space-around;padding:2px 20px 0}
+#shutter{width:74px;height:74px;border-radius:50%;border:4px solid #fff;display:flex;align-items:center;justify-content:center}
+#shutter i{display:block;width:58px;height:58px;border-radius:50%;background:#fff;transition:transform .1s}
+#shutter:active i{transform:scale(.88)}
+#shutter.auto{border-color:var(--accent)}
+#thumbBtn{width:48px;height:48px;border-radius:10px;background:var(--chip) center/cover no-repeat;border:2px solid rgba(255,255,255,.5)}
+#autoBtn{width:48px;height:48px;border-radius:24px;background:var(--chip);font-size:11px;font-weight:700;line-height:1.1;display:flex;flex-direction:column;align-items:center;justify-content:center}
+#autoBtn.on{background:rgba(52,211,153,.25);color:var(--accent)}
+
+/* 开始页 */
+#start{position:absolute;inset:0;background:radial-gradient(circle at 50% 30%,#1b2a3a,#050608 70%);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px;text-align:center;gap:18px;z-index:20}
+#start h1{margin:0;font-size:28px;letter-spacing:1px}
+#start p{margin:0;color:var(--muted);font-size:15px;line-height:1.6;max-width:380px}
+#startBtn{margin-top:6px;padding:14px 34px;border-radius:28px;background:var(--accent);color:#04120c;font-size:18px;font-weight:700}
+#startBtn:disabled{opacity:.6}
+#loadMsg{font-size:13px;color:var(--muted);min-height:20px}
+.features{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;font-size:13px;color:var(--muted);text-align:left;max-width:340px}
+.features b{color:#fff;font-weight:600}
+
+/* 弹层 */
+.sheet{position:absolute;left:0;right:0;bottom:0;max-height:82%;overflow-y:auto;background:#16181c;border-radius:18px 18px 0 0;padding:14px 16px calc(18px + var(--safe-b));transform:translateY(105%);transition:transform .25s;z-index:30}
+.sheet.open{transform:none}
+.sheet h3{margin:4px 0 12px;font-size:17px;display:flex;justify-content:space-between;align-items:center}
+.sheet h3 button{font-size:15px;color:var(--accent);padding:4px 8px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);font-size:15px}
+.row small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.seg{display:flex;background:var(--chip);border-radius:9px;padding:2px;flex:none}
+.seg button{padding:6px 10px;border-radius:7px;font-size:13px;color:var(--muted)}
+.seg button.on{background:#fff;color:#000}
+.sw{width:50px;height:30px;border-radius:15px;background:rgba(255,255,255,.2);position:relative;flex:none;transition:background .2s}
+.sw::after{content:"";position:absolute;left:3px;top:3px;width:24px;height:24px;border-radius:12px;background:#fff;transition:left .2s}
+.sw.on{background:var(--accent)}
+.sw.on::after{left:23px}
+input[type=range]{width:140px;accent-color:var(--accent)}
+.btnRow{display:flex;gap:10px;flex-wrap:wrap;padding-top:14px}
+.btn{flex:1 1 140px;padding:12px;border-radius:12px;background:var(--chip);font-size:14px;text-align:center}
+.btn.danger{color:var(--bad)}
+#mask{position:absolute;inset:0;background:rgba(0,0,0,.4);opacity:0;pointer-events:none;transition:opacity .25s;z-index:25}
+#mask.open{opacity:1;pointer-events:auto}
+
+#gallery{position:absolute;inset:0;background:#000;z-index:40;display:none;flex-direction:column}
+#gallery.open{display:flex}
+#galTop{display:flex;justify-content:space-between;align-items:center;padding:calc(12px + var(--safe-t)) 14px 10px}
+#galTop button{font-size:16px;color:var(--accent);padding:6px}
+#galView{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+#galView img{max-width:100%;max-height:100%;object-fit:contain}
+#galStrip{display:flex;gap:6px;overflow-x:auto;padding:10px 12px calc(12px + var(--safe-b))}
+#galStrip img{width:56px;height:56px;object-fit:cover;border-radius:8px;border:2px solid transparent;flex:none}
+#galStrip img.on{border-color:var(--accent)}
+#galActions{display:flex;gap:10px;padding:0 14px 8px}
+#galActions button{flex:1;padding:12px;border-radius:12px;background:var(--chip);font-size:15px}
+
+#toast{position:absolute;left:50%;top:calc(80px + var(--safe-t));transform:translateX(-50%);background:var(--panel);padding:8px 14px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;max-width:88%;text-align:center}
+#toast.show{opacity:1}
+#dbgBox{position:absolute;right:10px;bottom:calc(190px + var(--safe-b));font:11px/1.35 ui-monospace,Menlo,monospace;color:rgba(255,255,255,.75);text-align:right;text-shadow:0 1px 2px #000;pointer-events:none;white-space:pre}
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="vid" playsinline muted autoplay></video>
+  <canvas id="cv"></canvas>
+  <div id="flash"></div>
+
+  <div id="top">
+    <div id="scoreWrap" aria-label="匹配度">
+      <svg viewBox="0 0 58 58"><circle cx="29" cy="29" r="25" fill="rgba(0,0,0,.35)" stroke="rgba(255,255,255,.2)" stroke-width="5"/>
+        <circle id="scoreArc" cx="29" cy="29" r="25" fill="none" stroke="#34d399" stroke-width="5" stroke-linecap="round" stroke-dasharray="157.1" stroke-dashoffset="157.1"/></svg>
+      <div id="scoreNum">--</div>
+    </div>
+    <div id="tplInfo"><div id="tplName">—</div><div id="tplSub">选择下方姿势模板</div></div>
+    <button class="iconBtn" id="voiceBtn" title="语音引导"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path id="voiceWave" d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></svg></button>
+    <button class="iconBtn" id="flipBtn" title="切换前后摄像头"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-3l-2-3H9L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M9 13.5a3 3 0 0 1 5.2-2M15 12.5a3 3 0 0 1-5.2 2"/><path d="M14.5 9v2.5H12M9.5 17v-2.5H12"/></svg></button>
+    <button class="iconBtn" id="setBtn" title="设置"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+  </div>
+  <div id="dbgBox"></div>
+
+  <div id="countRing"><svg viewBox="0 0 110 110" width="110" height="110"><circle cx="55" cy="55" r="48" fill="rgba(0,0,0,.25)" stroke="rgba(255,255,255,.25)" stroke-width="7"/>
+    <circle id="countArc" cx="55" cy="55" r="48" fill="none" stroke="#34d399" stroke-width="7" stroke-linecap="round" stroke-dasharray="301.6" stroke-dashoffset="301.6"/></svg><div id="countTxt">保持住</div></div>
+
+  <div id="guide"><div id="msgMain">正在准备…</div><div id="msgSub"></div></div>
+
+  <div id="bottom">
+    <div id="chips"></div>
+    <div id="controls">
+      <button id="thumbBtn" title="相册"></button>
+      <button id="shutter" title="拍照"><i></i></button>
+      <button id="autoBtn" title="自动快门"><span>自动</span><span>快门</span></button>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <div id="mask"></div>
+
+  <div class="sheet" id="settings">
+    <h3>设置 <button id="setClose">完成</button></h3>
+    <div class="row"><div>站位调整方式<small>谁来移动，让人站到目标位置</small></div>
+      <div class="seg" id="segMove"><button data-v="subject">被拍者走动</button><button data-v="phone">拍摄者移手机</button></div></div>
+    <div class="row"><div>语音引导<small>用中文播报给被拍者听</small></div><div class="sw" id="swVoice"></div></div>
+    <div class="row"><div>自动快门<small>匹配度达标并保持后自动拍摄</small></div><div class="sw" id="swAuto"></div></div>
+    <div class="row"><div>快门阈值 <b id="thrVal">85</b> 分<small>越高越严格</small></div><input type="range" id="thr" min="60" max="95" step="1" value="85"></div>
+    <div class="row"><div>姿态模型<small>标准版更准，但更耗电</small></div>
+      <div class="seg" id="segModel"><button data-v="lite">快速</button><button data-v="full">标准</button></div></div>
+    <div class="row"><div>显示骨架与辅助线</div><div class="sw" id="swSkel"></div></div>
+    <div class="row"><div>调试信息<small>帧率与各项分数</small></div><div class="sw" id="swDbg"></div></div>
+    <div class="btnRow">
+      <button class="btn" id="importBtn">从照片导入姿势</button>
+      <button class="btn" id="saveCurBtn">当前姿势存为模板</button>
+      <button class="btn danger" id="delTplBtn">删除当前自定义模板</button>
+    </div>
+    <input type="file" id="fileIn" accept="image/*" hidden>
+  </div>
+
+  <div id="gallery">
+    <div id="galTop"><button id="galClose">‹ 返回</button><span id="galCount"></span><span style="width:60px"></span></div>
+    <div id="galView"><img id="galImg" alt=""></div>
+    <div id="galActions"><button id="galSave">保存 / 分享</button><button id="galDel">删除</button></div>
+    <div id="galStrip"></div>
+  </div>
+
+  <div id="start">
+    <h1>AI 姿势引导相机</h1>
+    <p>选一个姿势，被拍者按语音提示调整站位、朝向和动作，对准后自动拍照。</p>
+    <div class="features">
+      <div><b>轮廓对齐</b><br>目标姿势叠加在取景框</div>
+      <div><b>语音引导</b><br>被拍者不看屏幕也能调</div>
+      <div><b>朝向识别</b><br>身体转向与脸部朝向</div>
+      <div><b>照片转模板</b><br>导入参考图复刻姿势</div>
+    </div>
+    <button id="startBtn">开始（打开相机）</button>
+    <div id="loadMsg">首次加载约需下载 20MB 模型文件</div>
+  </div>
+</div>
+
+<script type="module">
+/* ====================== 常量与工具 ====================== */
+const MP_VER = '1.0.1';
+const MP_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}`;
+const MODEL = {
+  lite: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+  full: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
+  face: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+};
+// BlazePose 关键点编号（L/R 指被拍者自己的左/右）
+const K = {nose:0, LS:11, RS:12, LE:13, RE:14, LW:15, RW:16, LH:23, RH:24, LK:25, RK:26, LA:27, RA:28};
+const USED = [0,11,12,13,14,15,16,23,24,25,26,27,28];
+const CORE = [0,11,12,23,24,27,28];          // 用于计算人物外框（不含手，避免举手改变外框）
+const LIMBS = [ // [名称, 起点, 终点, 侧, 类型, 权重]
+  ['左上臂',11,13,'L','armU',1.2], ['左小臂',13,15,'L','armL',1.0],
+  ['右上臂',12,14,'R','armU',1.2], ['右小臂',14,16,'R','armL',1.0],
+  ['左大腿',23,25,'L','legU',1.0], ['左小腿',25,27,'L','legL',0.8],
+  ['右大腿',24,26,'R','legU',1.0], ['右小腿',26,28,'R','legL',0.8],
+];
+const clamp = (v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+const deg = r=>r*180/Math.PI, rad = d=>d*Math.PI/180;
+const wrap180 = a=>{a=((a+180)%360+360)%360-180;return a;};
+const $ = id=>document.getElementById(id);
+const store = {
+  get(k,d){try{const v=localStorage.getItem('posecam_'+k);return v==null?d:JSON.parse(v);}catch(e){return d;}},
+  set(k,v){try{localStorage.setItem('posecam_'+k,JSON.stringify(v));}catch(e){}}
+};
+
+/* ====================== 姿势模板（正向运动学生成） ======================
+   单位：人体高度≈1。坐标 x 向画面右、y 向下。被拍者面对镜头时，其"左侧"出现在画面右侧（+x）。
+   a = 肢体相对"竖直向下"的外展角（度），正值向身体外侧/向上抬，负值向身体内侧。
+   yaw = 身体朝向（度），正值 = 向被拍者自己的左边转；face = 脸部朝向（相对镜头），null 表示不要求。
+   target = 人物核心外框(鼻子~脚踝)在画面中的 中心x、中心y、高度占比。 */
+function fk(o){
+  const yaw=o.yaw||0, c=Math.cos(rad(yaw)), lean=rad(o.lean||0);
+  const P={};
+  const sm=[0,0.2];
+  const hm=[sm[0]+Math.sin(lean)*0.30, sm[1]+Math.cos(lean)*0.30];
+  P[K.nose]=[sm[0]+0.035*Math.sin(rad(o.face??0)) - Math.sin(lean)*0.1, sm[1]-0.095];
+  P[K.LS]=[sm[0]+0.115*c, sm[1]]; P[K.RS]=[sm[0]-0.115*c, sm[1]];
+  P[K.LH]=[hm[0]+0.075*c, hm[1]]; P[K.RH]=[hm[0]-0.075*c, hm[1]];
+  const seg=(from,a,len,side)=>{const t=rad(side==='L'?a:-a);return [from[0]+Math.sin(t)*len, from[1]+Math.cos(t)*len];};
+  const A=o.arms, L=o.legs;
+  P[K.LE]=seg(P[K.LS],A[0],0.16,'L'); P[K.LW]=seg(P[K.LE],A[1],0.14,'L');
+  P[K.RE]=seg(P[K.RS],A[2],0.16,'R'); P[K.RW]=seg(P[K.RE],A[3],0.14,'R');
+  P[K.LK]=seg(P[K.LH],L[0],0.235,'L'); P[K.LA]=seg(P[K.LK],L[1],0.235,'L');
+  P[K.RK]=seg(P[K.RH],L[2],0.235,'R'); P[K.RA]=seg(P[K.RK],L[3],0.235,'R');
+  return P;
+}
+const BUILTIN = [
+  {id:'stand', name:'自然站立', tip:'放松站直，双手自然下垂', yaw:0, face:0, target:{cx:.5,cy:.47,h:.56},
+    arms:[8,4,8,4], legs:[4,2,4,2]},
+  {id:'hip1', name:'单手叉腰', tip:'身体微侧，左手叉腰，重心放右脚', yaw:25, face:10, target:{cx:.38,cy:.47,h:.56},
+    arms:[38,-45,8,3], legs:[10,-4,2,1]},
+  {id:'hip2', name:'双手叉腰', tip:'正面站立，双手叉腰，双脚略分开', yaw:0, face:0, target:{cx:.5,cy:.47,h:.56},
+    arms:[38,-45,38,-45], legs:[9,3,9,3]},
+  {id:'turn', name:'侧身回眸', tip:'身体转向左侧，脸转回来看镜头', yaw:55, face:15, target:{cx:.64,cy:.47,h:.56},
+    arms:[6,3,6,3], legs:[6,2,1,1]},
+  {id:'wave', name:'挥手招呼', tip:'右手举起挥手，微笑', yaw:10, face:0, target:{cx:.5,cy:.48,h:.54},
+    arms:[8,4,100,170], legs:[5,2,5,2]},
+  {id:'cheer', name:'欢呼举手', tip:'双手高举过头，双脚分开', yaw:0, face:0, target:{cx:.5,cy:.50,h:.50},
+    arms:[150,165,150,165], legs:[12,6,12,6]},
+  {id:'cross', name:'交叉腿', tip:'双手插兜，左腿交叉到右腿前', yaw:15, face:5, target:{cx:.40,cy:.47,h:.56},
+    arms:[14,-12,14,-12], legs:[-10,-16,3,2]},
+  {id:'gaze', name:'眺望远方', tip:'双手背后，头转向左边看远处', yaw:20, face:45, target:{cx:.36,cy:.47,h:.56},
+    arms:[6,-25,6,-25], legs:[8,2,2,1]},
+  {id:'walk', name:'迈步走', tip:'身体微侧，左脚向前迈一步', yaw:35, face:0, target:{cx:.5,cy:.47,h:.56},
+    arms:[-8,-10,14,20], legs:[14,2,-6,-2]},
+];
+function buildTemplate(t){
+  if(t.kp) return t;
+  return {...t, kp:fk(t)};
+}
+let templates = BUILTIN.map(buildTemplate);
+let custom = store.get('custom', []);
+function allTemplates(){ return templates.concat(custom); }
+
+/* ====================== 状态 ====================== */
+const S = {
+  facing: store.get('facing','environment'),
+  moveMode: store.get('moveMode','subject'),
+  voice: store.get('voice', true),
+  auto: store.get('auto', true),
+  thr: store.get('thr', 85),
+  model: store.get('model','lite'),
+  skel: store.get('skel', true),
+  dbg: store.get('dbg', false),
+  tplId: store.get('tplId','stand'),
+  running:false, stream:null,
+  pose:null, face:null, poseImg:null, vision:null,
+  lm:null, world:null, faceLm:null, lastSeen:0, frame:0,
+  fps:0, lastT:0, detMs:0,
+  score:0, scoreS:0, parts:null, guide:null,
+  shutterState:'idle', armed:true, holdT0:0, coolUntil:0,
+  photos:[], galIdx:0,
+};
+const cv=$('cv'), ctx=cv.getContext('2d'), vid=$('vid');
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1, 2);
+  W=Math.round(cv.clientWidth*DPR); H=Math.round(cv.clientHeight*DPR);
+  cv.width=W; cv.height=H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function curTpl(){ return allTemplates().find(t=>t.id===S.tplId) || templates[0]; }
+
+/* ====================== 语音 ====================== */
+const Voice = {
+  zh:null, lastMsg:'', lastAt:0, pendingMsg:'', pendingSince:0,
+  init(){
+    if(!('speechSynthesis' in window)) return;
+    const pick=()=>{const vs=speechSynthesis.getVoices();
+      this.zh = vs.find(v=>/zh[-_]CN/i.test(v.lang)) || vs.find(v=>/^zh/i.test(v.lang)) || vs.find(v=>/cmn/i.test(v.lang)) || null;};
+    pick(); speechSynthesis.onvoiceschanged=pick;
+  },
+  unlock(){ // iOS 需要在用户点击时先播一次
+    try{ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u);}catch(e){}
+  },
+  speak(msg, force=false){
+    if(!S.voice || !('speechSynthesis' in window)) return;
+    const now=performance.now();
+    if(!force && speechSynthesis.speaking && now-this.lastAt<2600) return;
+    try{
+      speechSynthesis.cancel();
+      const u=new SpeechSynthesisUtterance(msg);
+      u.lang='zh-CN'; if(this.zh) u.voice=this.zh; u.rate=1.08; u.pitch=1;
+      speechSynthesis.speak(u);
+    }catch(e){}
+    this.lastMsg=msg; this.lastAt=now;
+  },
+  // 指令需稳定一小段时间才播报，避免来回跳
+  offer(msg){
+    const now=performance.now();
+    if(msg!==this.pendingMsg){ this.pendingMsg=msg; this.pendingSince=now; return; }
+    if(now-this.pendingSince<450) return;
+    if(msg!==this.lastMsg){ if(now-this.lastAt>1900) this.speak(msg); }
+    else if(now-this.lastAt>5500) this.speak(msg);
+  }
+};
+Voice.init();
+
+/* ====================== 提示音 ====================== */
+let actx=null;
+function beep(type){
+  try{
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)();
+    const t=actx.currentTime;
+    if(type==='shutter'){
+      const len=0.09, buf=actx.createBuffer(1, actx.sampleRate*len, actx.sampleRate), d=buf.getChannelData(0);
+      for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,3);
+      const s=actx.createBufferSource(); s.buffer=buf; const g=actx.createGain(); g.gain.value=0.6;
+      s.connect(g).connect(actx.destination); s.start(t);
+    }else{
+      const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=type==='ok'?880:660;
+      g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.25,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+0.15);
+      o.connect(g).connect(actx.destination); o.start(t); o.stop(t+0.16);
+    }
+  }catch(e){}
+}
+
+/* ====================== MediaPipe 加载 ====================== */
+async function loadModels(onMsg){
+  onMsg('加载识别引擎…');
+  const mp = await import(`${MP_URL}/vision_bundle.mjs`);
+  S.mp = mp;
+  S.vision = await mp.FilesetResolver.forVisionTasks(`${MP_URL}/wasm`);
+  onMsg('加载姿态模型…');
+  S.pose = await createWithFallback(mp.PoseLandmarker, {
+    baseOptions:{modelAssetPath:MODEL[S.model]}, runningMode:'VIDEO', numPoses:1,
+    minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5});
+  onMsg('加载人脸模型…');
+  try{
+    S.face = await createWithFallback(mp.FaceLandmarker, {
+      baseOptions:{modelAssetPath:MODEL.face}, runningMode:'VIDEO', numFaces:1,
+      outputFaceBlendshapes:false, outputFacialTransformationMatrixes:false});
+  }catch(e){ console.warn('face model failed', e); S.face=null; }
+}
+async function createWithFallback(Cls, opts){
+  const tryDel = async (delegate)=>Cls.createFromOptions(S.vision, {...opts, baseOptions:{...opts.baseOptions, delegate}});
+  try{ return await tryDel('GPU'); }catch(e){ console.warn('GPU failed, fallback CPU', e); return await tryDel('CPU'); }
+}
+async function switchModel(m){
+  if(!S.mp || S.model===m) { S.model=m; return; }
+  S.model=m; store.set('model',m);
+  toast('切换模型中…');
+  const old=S.pose; S.pose=null;
+  try{ S.pose = await createWithFallback(S.mp.PoseLandmarker, {
+      baseOptions:{modelAssetPath:MODEL[m]}, runningMode:'VIDEO', numPoses:1,
+      minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5});
+    old && old.close(); toast(m==='full'?'已切换到标准模型':'已切换到快速模型');
+  }catch(e){ S.pose=old; toast('模型加载失败'); }
+}
+
+/* ====================== 摄像头 ====================== */
+async function startCamera(){
+  if(S.stream){ S.stream.getTracks().forEach(t=>t.stop()); S.stream=null; }
+  const portrait = window.innerHeight >= window.innerWidth;
+  const cons = {audio:false, video:{facingMode:{ideal:S.facing},
+    width:{ideal: portrait?1080:1920}, height:{ideal: portrait?1920:1080}}};
+  S.stream = await navigator.mediaDevices.getUserMedia(cons);
+  vid.srcObject = S.stream;
+  await vid.play();
+  await new Promise(r=>{ if(vid.videoWidth) r(); else vid.onloadedmetadata=()=>r(); });
+  S.lm=null; S.faceLm=null; S.world=null;
+}
+
+/* ====================== 坐标映射（视频 → 画面裁切区域） ====================== */
+function crop(){
+  const vw=vid.videoWidth, vh=vid.videoHeight;
+  const sc=Math.max(W/vw, H/vh), sw=W/sc, sh=H/sc;
+  return {vw,vh,sc,sw,sh,sx:(vw-sw)/2, sy:(vh-sh)/2};
+}
+function toPx(l, C){ return {x:(l.x*C.vw - C.sx)*C.sc, y:(l.y*C.vh - C.sy)*C.sc, v:l.visibility??1}; }
+
+/* ====================== 模板放置到画面 ====================== */
+function bboxOf(P, idxs, visFn){
+  let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9,n=0;
+  for(const i of idxs){ const p=P[i]; if(!p || (visFn && !visFn(i))) continue;
+    const x=p[0]??p.x, y=p[1]??p.y; x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y); n++; }
+  return n?{x0,x1,y0,y1,cx:(x0+x1)/2,cy:(y0+y1)/2,w:x1-x0,h:y1-y0,n}:null;
+}
+function placeTemplate(t){
+  const b=bboxOf(t.kp, CORE);
+  const sc=t.target.h*H/b.h, ox=t.target.cx*W, oy=t.target.cy*H;
+  const out={};
+  for(const i of USED){ const p=t.kp[i]; if(!p) continue; out[i]={x:(p[0]-b.cx)*sc+ox, y:(p[1]-b.cy)*sc+oy, v:p[2]??1}; }
+  out._scale=sc; out._box={x0:(b.x0-b.cx)*sc+ox, x1:(b.x1-b.cx)*sc+ox, y0:(b.y0-b.cy)*sc+oy, y1:(b.y1-b.cy)*sc+oy};
+  return out;
+}
+
+/* ====================== 朝向估计 ====================== */
+// 身体朝向：世界坐标中左右肩连线的水平角。正值 = 向被拍者自己的左边转（左肩远离镜头）
+function bodyYaw(world){
+  if(!world) return null;
+  const L=world[K.LS], R=world[K.RS];
+  if(!L||!R) return null;
+  const Lh=world[K.LH], Rh=world[K.RH];
+  let dx=L.x-R.x, dz=L.z-R.z;
+  if(Lh&&Rh){ dx+= (Lh.x-Rh.x)*0.6; dz+=(Lh.z-Rh.z)*0.6; }
+  return deg(Math.atan2(dz, dx));
+}
+// 脸部朝向：鼻尖相对两颊中点的偏移。正值 = 头转向被拍者自己的左边
+function faceYaw(fl, C){
+  if(!fl) return null;
+  const n=toPx(fl[1],C), a=toPx(fl[234],C), b=toPx(fl[454],C);
+  const mid=(a.x+b.x)/2, half=Math.abs(b.x-a.x)/2;
+  if(half<4) return null;
+  return deg(Math.asin(clamp((n.x-mid)/half*0.85,-1,1)));
+}
+
+/* ====================== 匹配与引导 ====================== */
+function limbAngle(p,q){ return deg(Math.atan2(q.x-p.x, q.y-p.y)); } // 相对竖直向下，正值偏向画面右
+function evaluate(cur, tgt, yawNow, faceNow, tpl){
+  const vis = i=>cur[i] && cur[i].v>0.5;
+  const limbs=[];
+  let ps=0, pw=0;
+  for(const [name,a,b,side,type,w] of LIMBS){
+    if(!vis(a)||!vis(b)||!tgt[a]||!tgt[b]||(tgt[b].v??1)<0.4) continue;
+    const ac=limbAngle(cur[a],cur[b]), at=limbAngle(tgt[a],tgt[b]);
+    const d=wrap180(at-ac);
+    const out = side==='L'? d : -d;           // 正 = 需要更向外/更向上
+    const s=clamp(1-(Math.abs(d)-8)/50);
+    limbs.push({name,side,type,d,out,s,a,b}); ps+=s*w; pw+=w;
+  }
+  const minLimb = limbs.length? Math.min(...limbs.map(l=>l.s)) : 0;
+  const poseS = pw? 0.65*ps/pw + 0.35*minLimb : 0;
+  const cb=bboxOf(cur, CORE, vis), tb=tgt._box;
+  const tcx=(tb.x0+tb.x1)/2, tcy=(tb.y0+tb.y1)/2, th=tb.y1-tb.y0;
+  const feet = vis(K.LA)||vis(K.RA), head=vis(K.nose);
+  let dx=0,dy=0,dh=0,posS=0,distS=0;
+  if(cb){
+    dx=(tcx-cb.cx)/W; dy=(tcy-cb.cy)/H; dh=(feet&&head)? (cb.h-th)/th : 0;
+    posS=clamp(1-(Math.hypot(dx, dy*0.8)-0.03)/0.13);
+    distS=(feet&&head)? clamp(1-(Math.abs(dh)-0.06)/0.3) : 0.3;
+  }
+  let dyaw=null,yawS=0.6; if(yawNow!=null){ dyaw=wrap180((tpl.yaw||0)-yawNow); yawS=clamp(1-(Math.abs(dyaw)-10)/40); }
+  let dface=null,faceS=null; if(tpl.face!=null && faceNow!=null){ dface=wrap180(tpl.face-faceNow); faceS=clamp(1-(Math.abs(dface)-8)/35); }
+  let total;
+  if(faceS==null) total = 0.55*poseS+0.15*posS+0.12*distS+0.18*yawS;
+  else total = 0.45*poseS+0.15*posS+0.10*distS+0.15*yawS+0.15*faceS;
+  // 任何一项明显不达标都会压低总分（取最差项封顶），避免"平均分好看但实际没对准"
+  const worstPart=Math.min(poseS, posS, distS, yawS, faceS==null?1:faceS);
+  total=Math.min(total, 0.45+0.55*worstPart);
+  if(!cb || cb.n<4) total*=0.3;
+  return {total:Math.round(total*100), poseS,posS,distS,yawS,faceS, dx,dy,dh,dyaw,dface, limbs, feet, head, cb};
+}
+
+function guidance(E){
+  const front = S.facing==='user';
+  const mode = front ? 'subject' : S.moveMode;
+  const side = v=> v>0?'左':'右';
+  const steps = v=> Math.abs(v)>0.14?'两步':'一小步';
+  // 1. 全身入镜
+  if(!E.head) return {who:'拍摄者', msg:'让被拍者的头部进入画面', key:'nohead'};
+  if(!E.feet){
+    return mode==='phone'||front ? {who:'拍摄者', msg: front?'手机放远一点，让全身入镜':'后退一步或缩小画面，让脚进入画面', key:'nofeet'}
+                                 : {who:'被拍者', msg:'请往后退，让全身入镜', key:'nofeet'};
+  }
+  // 2. 远近
+  if(Math.abs(E.dh)>0.13){
+    const tooBig=E.dh>0;
+    if(mode==='phone') return {who:'拍摄者', msg: tooBig?'拍摄者往后退一步':'拍摄者往前走一步', key:'dist'};
+    return {who:'被拍者', msg: front ? (tooBig?'手机放远一点':'手机拿近一点') : (tooBig?'请往后退'+(E.dh>0.35?'两步':'一步'):'请往前走'+(E.dh<-0.3?'两步':'一步')), key:'dist'};
+  }
+  // 3. 左右站位（原始画面中 +x = 被拍者自己的左边）
+  if(Math.abs(E.dx)>0.06){
+    if(mode==='phone'){
+      // 后置：拍摄者与镜头同向，镜头往 -x 移，人物在画面中就往 +x 走
+      return {who:'拍摄者', msg:`手机向${E.dx>0?'左':'右'}平移一点`, key:'dx'};
+    }
+    return {who:'被拍者', msg:`往你的${side(E.dx)}边走${steps(E.dx)}`, key:'dx'};
+  }
+  // 4. 上下（只能靠手机俯仰）
+  if(Math.abs(E.dy)>0.07){
+    return {who:'拍摄者', msg: E.dy>0?'手机稍微向上仰一点':'手机稍微向下俯一点', key:'dy'};
+  }
+  // 5. 身体朝向
+  if(E.dyaw!=null && Math.abs(E.dyaw)>18){
+    return {who:'被拍者', msg:`身体向你的${side(E.dyaw)}边${Math.abs(E.dyaw)>40?'转过去':'再转一点'}`, key:'yaw'};
+  }
+  // 6. 肢体（只提示误差最大的一个）
+  // 先纠正靠近躯干的关节（上臂/大腿），再纠正小臂/小腿
+  const wgt=l=>Math.abs(l.d)*(l.type.endsWith('U')?1.5:1)*(l.type.startsWith('arm')?1.1:1);
+  const worst = E.limbs.filter(l=>Math.abs(l.d)>24).sort((a,b)=>wgt(b)-wgt(a))[0];
+  if(worst){
+    const s=worst.side==='L'?'左':'右', up=worst.out>0;
+    const M={armU: up?`${s}手臂再抬高一点`:`${s}手臂放低一点`,
+             armL: up?`${s}小臂往外打开一点`:`${s}手往身体方向收一点`,
+             legU: up?`${s}腿往外迈开一点`:`${s}腿往里收一点`,
+             legL: up?`${s}小腿往外一点`:`${s}小腿往里收一点`};
+    return {who:'被拍者', msg:M[worst.type], key:'limb:'+worst.name+up, limb:worst};
+  }
+  // 7. 脸部朝向
+  if(E.dface!=null && Math.abs(E.dface)>15){
+    return {who:'被拍者', msg:`头再向你的${side(E.dface)}边转一点`, key:'face'};
+  }
+  return {who:'', msg:'很好，保持住！', key:'ok', ok:true};
+}
+
+/* ====================== 主循环 ====================== */
+let lastVideoTime=-1, smoothed=null, yawS=null, faceS=null;
+function loop(){
+  if(!S.running) return;
+  requestAnimationFrame(loop);
+  const now=performance.now();
+  if(vid.readyState>=2 && vid.currentTime!==lastVideoTime && S.pose){
+    lastVideoTime=vid.currentTime;
+    const t0=performance.now();
+    let res;
+    try{ res=S.pose.detectForVideo(vid, now); }catch(e){ console.warn(e); }
+    if(S.face && (S.frame%2===0)){
+      try{ const fr=S.face.detectForVideo(vid, now); S.faceLm = fr.faceLandmarks&&fr.faceLandmarks[0] || null; }catch(e){}
+    }
+    S.detMs = S.detMs*0.9 + (performance.now()-t0)*0.1;
+    S.frame++;
+    if(res && res.landmarks && res.landmarks[0]){
+      S.lm=res.landmarks[0]; S.world=res.worldLandmarks&&res.worldLandmarks[0]; S.lastSeen=now;
+    }else if(now-S.lastSeen>400){ S.lm=null; S.world=null; }
+    const dt=now-S.lastT; S.lastT=now; if(dt>0&&dt<1000) S.fps=S.fps*0.9+1000/dt*0.1;
+  }
+  process(now);
+  draw();
+}
+window.__injectFrame = (lm, world, faceLm)=>{ S.lm=lm; S.world=world; S.faceLm=faceLm; S.lastSeen=performance.now(); };
+
+function process(now){
+  if(!vid.videoWidth){ return; }
+  const C=crop();
+  const tpl=curTpl();
+  S.tgt = placeTemplate(tpl);
+  if(!S.lm){
+    smoothed=null; S.E=null; S.scoreS*=0.9;
+    const g={who:'被拍者', msg: now-S.lastSeen>1500? '请站到画面中':'正在寻找人物…', key:'none'};
+    setGuide(g); if(now-S.lastSeen>1500) Voice.offer(g.msg);
+    updateScore(0); shutterTick(0, now);
+    return;
+  }
+  // 平滑
+  const cur={};
+  for(const i of USED){ const p=toPx(S.lm[i],C); cur[i]=p; }
+  if(smoothed){ for(const i of USED){ const s=smoothed[i], p=cur[i]; const a=0.55; p.x=s.x+(p.x-s.x)*a; p.y=s.y+(p.y-s.y)*a; } }
+  smoothed=cur;
+  const y=bodyYaw(S.world); if(y!=null) yawS = yawS==null? y : yawS+wrap180(y-yawS)*0.3;
+  const f=faceYaw(S.faceLm, C); if(f!=null) faceS = faceS==null? f : faceS+(f-faceS)*0.35; else if(!S.faceLm) faceS=null;
+  const E=evaluate(cur, S.tgt, y==null?null:yawS, faceS, tpl);
+  S.E=E; S.cur=cur;
+  S.scoreS = S.scoreS*0.75 + E.total*0.25;
+  const sc=Math.round(S.scoreS);
+  updateScore(sc);
+  const g=guidance(E);
+  S.guide=g;
+  setGuide(g);
+  const inHold = S.shutterState==='hold';
+  if(!inHold && now>S.coolUntil) Voice.offer(g.msg);
+  shutterTick(sc, now);
+  if(S.dbg){
+    $('dbgBox').textContent = `FPS ${S.fps.toFixed(0)}  识别 ${S.detMs.toFixed(0)}ms\n姿势 ${(E.poseS*100|0)} 位置 ${(E.posS*100|0)} 远近 ${(E.distS*100|0)}\n朝向 ${(E.yawS*100|0)} 脸 ${E.faceS==null?'-':(E.faceS*100|0)}\n身体yaw ${yawS==null?'-':yawS.toFixed(0)}° 目标 ${tpl.yaw||0}°\n脸yaw ${faceS==null?'-':faceS.toFixed(0)}° 目标 ${tpl.face??'-'}\ndx ${E.dx.toFixed(2)} dy ${E.dy.toFixed(2)} dh ${E.dh.toFixed(2)}`;
+  }
+}
+
+let lastGuideKey='';
+function setGuide(g){
+  const el=$('msgMain');
+  if(el.textContent!==g.msg) el.textContent=g.msg;
+  el.classList.toggle('ok', !!g.ok);
+  const sub = g.ok ? (S.auto&&S.armed?'对准了，即将自动拍摄':'对准了，可以按快门（换个姿势会再次自动拍）') : (g.who? g.who+'调整':'');
+  if($('msgSub').textContent!==sub) $('msgSub').textContent=sub;
+  if(g.key!==lastGuideKey && g.ok) beep('ok');
+  lastGuideKey=g.key;
+}
+function updateScore(sc){
+  $('scoreNum').textContent = S.lm? sc : '--';
+  const arc=$('scoreArc'); arc.style.strokeDashoffset = 157.1*(1-sc/100);
+  arc.style.stroke = sc>=S.thr? '#34d399' : sc>=S.thr-20? '#fbbf24' : '#f87171';
+}
+
+/* ====================== 自动快门 ====================== */
+const HOLD_MS=1400;
+function shutterTick(sc, now){
+  const ring=$('countRing');
+  if(!S.auto || now<S.coolUntil){ ring.style.display='none'; if(S.shutterState==='hold') S.shutterState='idle'; return; }
+  if(S.shutterState==='idle'){
+    ring.style.display='none';
+    if(!S.armed){ if(sc<S.thr-15 || !S.lm) S.armed=true; return; }   // 拍完一张后，需先离开对齐状态才会再次自动拍
+    if(sc>=S.thr && S.guide && S.guide.ok){ S.shutterState='hold'; S.holdT0=now; Voice.speak('很好，保持住', true); }
+  }else if(S.shutterState==='hold'){
+    if(sc<S.thr-6 || !S.lm){ S.shutterState='idle'; ring.style.display='none'; return; }
+    const p=clamp((now-S.holdT0)/HOLD_MS);
+    ring.style.display='block';
+    $('countArc').style.strokeDashoffset = 301.6*(1-p);
+    $('countTxt').textContent = p<1? '保持住' : '咔嚓';
+    if(p>=1){ S.shutterState='idle'; S.armed=false; ring.style.display='none'; capture(true); }
+  }
+}
+
+/* ====================== 拍照 ====================== */
+async function capture(auto){
+  if(!vid.videoWidth) return;
+  const C=crop();
+  const c=document.createElement('canvas'); c.width=Math.round(C.sw); c.height=Math.round(C.sh);
+  const g=c.getContext('2d');
+  if(S.facing==='user'){ g.translate(c.width,0); g.scale(-1,1); }
+  g.drawImage(vid, C.sx, C.sy, C.sw, C.sh, 0,0, c.width, c.height);
+  beep('shutter');
+  const fl=$('flash'); fl.style.transition='none'; fl.style.opacity='.85'; requestAnimationFrame(()=>{fl.style.transition='opacity .35s'; fl.style.opacity='0';});
+  S.coolUntil = performance.now()+2600;
+  const blob = await new Promise(r=>c.toBlob(r,'image/jpeg',0.92));
+  const url=URL.createObjectURL(blob);
+  const ts=new Date(); const name=`pose_${ts.getFullYear()}${String(ts.getMonth()+1).padStart(2,'0')}${String(ts.getDate()).padStart(2,'0')}_${String(ts.getHours()).padStart(2,'0')}${String(ts.getMinutes()).padStart(2,'0')}${String(ts.getSeconds()).padStart(2,'0')}.jpg`;
+  S.photos.unshift({url, blob, name, score:Math.round(S.scoreS), tpl:curTpl().name});
+  $('thumbBtn').style.backgroundImage=`url(${url})`;
+  if(auto) Voice.speak('拍好了', true);
+}
+
+/* ====================== 绘制 ====================== */
+const LINES=[[11,12],[11,23],[12,24],[23,24],[11,13],[13,15],[12,14],[14,16],[23,25],[25,27],[24,26],[26,28]];
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  if(!vid.videoWidth) return;
+  const C=crop();
+  if(S.facing==='user') ctx.setTransform(-1,0,0,1,W,0);
+  ctx.drawImage(vid, C.sx, C.sy, C.sw, C.sh, 0,0, W,H);
+  const tgt=S.tgt; if(!tgt) return;
+  // 三分线
+  if(S.skel){
+    ctx.strokeStyle='rgba(255,255,255,.18)'; ctx.lineWidth=1*DPR; ctx.beginPath();
+    for(const f of [1/3,2/3]){ ctx.moveTo(W*f,0); ctx.lineTo(W*f,H); ctx.moveTo(0,H*f); ctx.lineTo(W,H*f); }
+    ctx.stroke();
+  }
+  // 目标轮廓（半透明人形）
+  const sc=tgt._scale, lw=Math.max(8*DPR, sc*0.048);
+  const ok = S.guide && S.guide.ok;
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  const ghost = ok? 'rgba(52,211,153,.42)' : 'rgba(255,255,255,.30)';
+  const edge  = ok? 'rgba(52,211,153,.95)' : 'rgba(255,255,255,.85)';
+  const path=()=>{ ctx.beginPath();
+    for(const [a,b] of LINES){ if(!tgt[a]||!tgt[b]) continue; ctx.moveTo(tgt[a].x,tgt[a].y); ctx.lineTo(tgt[b].x,tgt[b].y); } };
+  const torso=()=>{ ctx.beginPath(); ctx.moveTo(tgt[11].x,tgt[11].y); ctx.lineTo(tgt[12].x,tgt[12].y); ctx.lineTo(tgt[24].x,tgt[24].y); ctx.lineTo(tgt[23].x,tgt[23].y); ctx.closePath(); };
+  const headR = sc*0.066, hx=tgt[0].x, hy=tgt[0].y-headR*0.1;
+  // 描边
+  ctx.strokeStyle=edge; ctx.lineWidth=lw+4*DPR; path(); ctx.stroke();
+  torso(); ctx.lineWidth=lw*0.5+4*DPR; ctx.stroke();
+  ctx.beginPath(); ctx.arc(hx,hy,headR+2*DPR,0,Math.PI*2); ctx.fillStyle=edge; ctx.fill();
+  // 在人形内部重画视频并叠半透明色，只留下外轮廓线
+  ctx.save();
+  ctx.beginPath();
+  for(const [a,b] of LINES){ if(!tgt[a]||!tgt[b]) continue; capsule(tgt[a],tgt[b],lw/2); }
+  ctx.moveTo(tgt[11].x,tgt[11].y); ctx.lineTo(tgt[12].x,tgt[12].y); ctx.lineTo(tgt[24].x,tgt[24].y); ctx.lineTo(tgt[23].x,tgt[23].y); ctx.closePath();
+  ctx.moveTo(hx+headR,hy); ctx.arc(hx,hy,headR,0,Math.PI*2);
+  ctx.clip('nonzero');
+  ctx.setTransform(1,0,0,1,0,0);
+  if(S.facing==='user') ctx.setTransform(-1,0,0,1,W,0);
+  ctx.drawImage(vid, C.sx, C.sy, C.sw, C.sh, 0,0, W,H);
+  ctx.fillStyle=ghost; ctx.fillRect(0,0,W,H);
+  ctx.restore();
+
+  // 目标框与移动箭头
+  const E=S.E;
+  if(E && E.cb && S.guide && (S.guide.key==='dx'||S.guide.key==='dy')){
+    const tx=(tgt._box.x0+tgt._box.x1)/2, ty=(tgt._box.y0+tgt._box.y1)/2;
+    if(S.guide.key==='dx') arrow({x:E.cb.cx, y:E.cb.cy}, {x:tx, y:E.cb.cy});   // 人物需要移动的方向
+    else arrow({x:E.cb.cx, y:E.cb.cy}, {x:E.cb.cx, y:ty});
+  }
+  // 当前骨架
+  if(S.skel && S.cur){
+    const cur=S.cur; const lim={};
+    if(E) for(const l of E.limbs) lim[l.a+'-'+l.b]=l.s;
+    ctx.lineWidth=4*DPR;
+    for(const [a,b] of LINES){
+      const p=cur[a], q=cur[b]; if(!p||!q||p.v<0.5||q.v<0.5) continue;
+      const s=lim[a+'-'+b];
+      ctx.strokeStyle = s==null? 'rgba(255,255,255,.85)' : s>0.75? '#34d399' : s>0.4? '#fbbf24' : '#f87171';
+      if(S.guide && S.guide.limb && S.guide.limb.a===a && S.guide.limb.b===b){ ctx.lineWidth=8*DPR; }
+      ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke(); ctx.lineWidth=4*DPR;
+    }
+    ctx.fillStyle='#fff';
+    for(const i of USED){ const p=cur[i]; if(!p||p.v<0.5) continue; ctx.beginPath(); ctx.arc(p.x,p.y,4*DPR,0,Math.PI*2); ctx.fill(); }
+    // 需要调整的肢体：画出目标方向的虚线
+    if(S.guide && S.guide.limb){
+      const l=S.guide.limb, p=cur[l.a], tA=tgt[l.a], tB=tgt[l.b];
+      const len=Math.hypot(cur[l.b].x-p.x, cur[l.b].y-p.y);
+      const ang=Math.atan2(tB.x-tA.x, tB.y-tA.y);
+      ctx.setLineDash([8*DPR,7*DPR]); ctx.strokeStyle='#fbbf24'; ctx.lineWidth=5*DPR;
+      ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+Math.sin(ang)*len, p.y+Math.cos(ang)*len); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(p.x+Math.sin(ang)*len, p.y+Math.cos(ang)*len, 7*DPR, 0, Math.PI*2); ctx.fillStyle='#fbbf24'; ctx.fill();
+    }
+  }
+}
+function capsule(p,q,r){
+  const a=Math.atan2(q.y-p.y,q.x-p.x), nx=Math.cos(a+Math.PI/2)*r, ny=Math.sin(a+Math.PI/2)*r;
+  ctx.moveTo(p.x+nx,p.y+ny); ctx.lineTo(q.x+nx,q.y+ny);
+  ctx.arc(q.x,q.y,r,a+Math.PI/2,a-Math.PI/2,true);
+  ctx.lineTo(p.x-nx,p.y-ny);
+  ctx.arc(p.x,p.y,r,a-Math.PI/2,a+Math.PI/2,true);
+  ctx.closePath();
+}
+function arrow(from,to){
+  const dx=to.x-from.x, dy=to.y-from.y, L=Math.hypot(dx,dy); if(L<20) return;
+  const ux=dx/L, uy=dy/L, head=22*DPR;
+  const s={x:from.x+ux*L*0.15, y:from.y+uy*L*0.15}, e={x:to.x-ux*L*0.1, y:to.y-uy*L*0.1};
+  ctx.strokeStyle='#fbbf24'; ctx.fillStyle='#fbbf24'; ctx.lineWidth=7*DPR; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(e.x-ux*head*0.6,e.y-uy*head*0.6); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(e.x,e.y); ctx.lineTo(e.x-ux*head-uy*head*0.6, e.y-uy*head+ux*head*0.6); ctx.lineTo(e.x-ux*head+uy*head*0.6, e.y-uy*head-ux*head*0.6); ctx.closePath(); ctx.fill();
+}
+
+/* ====================== 模板缩略图 ====================== */
+function tplIcon(t){
+  const c=document.createElement('canvas'); c.width=80; c.height=104; const g=c.getContext('2d');
+  const b=bboxOf(t.kp, USED);
+  const sc=Math.min(64/Math.max(b.w,0.2), 88/b.h)*0.9;
+  const P=i=>t.kp[i]?{x:(t.kp[i][0]-b.cx)*sc+40, y:(t.kp[i][1]-b.cy)*sc+54}:null;
+  g.strokeStyle='#fff'; g.lineWidth=5; g.lineCap='round'; g.beginPath();
+  for(const [a,bb] of LINES){ const p=P(a),q=P(bb); if(!p||!q) continue; g.moveTo(p.x,p.y); g.lineTo(q.x,q.y); }
+  g.stroke();
+  const n=P(0); if(n){ g.beginPath(); g.arc(n.x,n.y-2,8,0,Math.PI*2); g.fillStyle='#fff'; g.fill(); }
+  return c.toDataURL();
+}
+function renderChips(){
+  const box=$('chips'); box.innerHTML='';
+  for(const t of allTemplates()){
+    const b=document.createElement('button'); b.className='chip'+(t.id===S.tplId?' active':'');
+    b.innerHTML=`<img alt="" src="${t._icon||(t._icon=tplIcon(t))}"><span>${t.name}</span>`;
+    b.onclick=()=>selectTpl(t.id);
+    box.appendChild(b);
+  }
+  const add=document.createElement('button'); add.className='chip add';
+  add.innerHTML=`<img alt="" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 52"><path d="M20 16v20M10 26h20" stroke="white" stroke-width="3" stroke-linecap="round"/></svg>')}"><span>导入照片</span>`;
+  add.onclick=()=>$('fileIn').click();
+  box.appendChild(add);
+  const act=box.querySelector('.chip.active'); act && act.scrollIntoView({inline:'center', block:'nearest'});
+}
+function selectTpl(id){
+  S.tplId=id; store.set('tplId',id);
+  const t=curTpl();
+  $('tplName').textContent=t.name; $('tplSub').textContent=t.tip||'';
+  renderChips();
+  S.shutterState='idle'; S.armed=true; $('countRing').style.display='none'; Voice.lastMsg='';
+  if(S.running) Voice.speak(`${t.name}。${t.tip||''}`, true);
+}
+
+/* ====================== 自定义模板 ====================== */
+function saveCustom(){ store.set('custom', custom.map(({_icon,...r})=>r)); }
+function kpFromLandmarks(lm, w, h){ // 归一化坐标 → 以高度为单位
+  const kp={}; for(const i of USED){ const l=lm[i]; kp[i]=[l.x*w/h, l.y, l.visibility??1]; } return kp;
+}
+async function importPhoto(file){
+  if(!S.mp){ toast('请先开始相机'); return; }
+  toast('正在识别照片中的姿势…');
+  try{
+    if(!S.poseImg){
+      S.poseImg = await createWithFallback(S.mp.PoseLandmarker, {baseOptions:{modelAssetPath:MODEL.full}, runningMode:'IMAGE', numPoses:1});
+    }
+    const img=new Image(); img.src=URL.createObjectURL(file); await img.decode();
+    const r=S.poseImg.detect(img);
+    if(!r.landmarks || !r.landmarks[0]){ toast('照片中没有识别到人物'); return; }
+    const lm=r.landmarks[0], w=img.naturalWidth, h=img.naturalHeight;
+    const kp=kpFromLandmarks(lm,w,h);
+    const vis=i=>kp[i][2]>0.5;
+    const b=bboxOf(kp, CORE, vis);
+    if(!b || !vis(0) || !(vis(27)||vis(28))){ toast('需要照片中能看到完整的头和脚'); }
+    const bb=b||bboxOf(kp,CORE);
+    const target={cx:clamp(bb.cx/(w/h),.2,.8), cy:clamp(bb.cy,.35,.55), h:clamp(bb.h,.3,.58)};
+    const yaw=Math.round(bodyYaw(r.worldLandmarks&&r.worldLandmarks[0])||0);
+    const n=custom.length+1;
+    const t={id:'c'+Date.now(), name:`我的姿势${n}`, tip:'按照片中的姿势摆', yaw, face:null, target, kp, custom:true};
+    custom.push(t); saveCustom(); selectTpl(t.id); toast('已生成模板：'+t.name);
+  }catch(e){ console.error(e); toast('识别失败：'+e.message); }
+}
+function saveCurrent(){
+  if(!S.lm){ toast('画面中没有人物'); return; }
+  const C=crop(); const cur={};
+  for(const i of USED){ const p=toPx(S.lm[i],C); cur[i]=[p.x/H, p.y/H, p.v]; }
+  const vis=i=>cur[i][2]>0.5; const b=bboxOf(cur, CORE, vis);
+  if(!b){ toast('没有识别到足够的关键点'); return; }
+  const target={cx:clamp(b.cx*H/W,.15,.85), cy:clamp(b.cy,.25,.75), h:clamp(b.h,.3,.85)};
+  const n=custom.length+1;
+  const t={id:'c'+Date.now(), name:`我的姿势${n}`, tip:'复刻刚才保存的姿势', yaw:Math.round(yawS||0), face: faceS==null?null:Math.round(faceS), target, kp:cur, custom:true};
+  custom.push(t); saveCustom(); selectTpl(t.id); toast('已保存：'+t.name);
+}
+function deleteCustom(){
+  const t=curTpl(); if(!t.custom){ toast('内置模板不能删除'); return; }
+  custom=custom.filter(x=>x.id!==t.id); saveCustom(); selectTpl('stand'); toast('已删除');
+}
+
+/* ====================== 相册 ====================== */
+function openGallery(){
+  if(!S.photos.length){ toast('还没有照片'); return; }
+  S.galIdx=0; $('gallery').classList.add('open'); renderGallery();
+}
+function renderGallery(){
+  const p=S.photos[S.galIdx]; if(!p){ $('gallery').classList.remove('open'); return; }
+  $('galImg').src=p.url; $('galCount').textContent=`${S.galIdx+1} / ${S.photos.length} · ${p.tpl} · ${p.score}分`;
+  const st=$('galStrip'); st.innerHTML='';
+  S.photos.forEach((ph,i)=>{ const im=document.createElement('img'); im.src=ph.url; if(i===S.galIdx) im.className='on'; im.onclick=()=>{S.galIdx=i;renderGallery();}; st.appendChild(im); });
+}
+async function sharePhoto(){
+  const p=S.photos[S.galIdx]; if(!p) return;
+  const file=new File([p.blob], p.name, {type:'image/jpeg'});
+  try{
+    if(navigator.canShare && navigator.canShare({files:[file]})){ await navigator.share({files:[file], title:p.name}); return; }
+  }catch(e){ if(e.name==='AbortError') return; }
+  const a=document.createElement('a'); a.href=p.url; a.download=p.name; document.body.appendChild(a); a.click(); a.remove();
+}
+
+/* ====================== UI 绑定 ====================== */
+let toastT=0;
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),2200); }
+function syncUI(){
+  $('swVoice').classList.toggle('on',S.voice); $('swAuto').classList.toggle('on',S.auto);
+  $('swSkel').classList.toggle('on',S.skel); $('swDbg').classList.toggle('on',S.dbg);
+  $('voiceBtn').classList.toggle('off',!S.voice); $('voiceWave').style.display=S.voice?'':'none';
+  $('autoBtn').classList.toggle('on',S.auto); $('shutter').classList.toggle('auto',S.auto);
+  $('thr').value=S.thr; $('thrVal').textContent=S.thr;
+  for(const b of $('segMove').children) b.classList.toggle('on', b.dataset.v===S.moveMode);
+  for(const b of $('segModel').children) b.classList.toggle('on', b.dataset.v===S.model);
+  $('dbgBox').style.display=S.dbg?'':'none';
+}
+function toggle(key){ S[key]=!S[key]; store.set(key,S[key]); syncUI(); }
+$('swVoice').onclick=()=>{ toggle('voice'); if(!S.voice) try{speechSynthesis.cancel();}catch(e){} };
+$('voiceBtn').onclick=()=>{ toggle('voice'); toast(S.voice?'语音引导已开启':'语音引导已关闭'); if(!S.voice) try{speechSynthesis.cancel();}catch(e){} };
+$('swAuto').onclick=()=>toggle('auto');
+$('autoBtn').onclick=()=>{ toggle('auto'); toast(S.auto?'自动快门已开启':'自动快门已关闭'); };
+$('swSkel').onclick=()=>toggle('skel');
+$('swDbg').onclick=()=>toggle('dbg');
+$('thr').oninput=e=>{ S.thr=+e.target.value; store.set('thr',S.thr); $('thrVal').textContent=S.thr; };
+$('segMove').onclick=e=>{ const v=e.target.dataset.v; if(!v) return; S.moveMode=v; store.set('moveMode',v); syncUI(); };
+$('segModel').onclick=e=>{ const v=e.target.dataset.v; if(!v) return; switchModel(v).then(syncUI); syncUI(); };
+const openSheet=()=>{ $('settings').classList.add('open'); $('mask').classList.add('open'); };
+const closeSheet=()=>{ $('settings').classList.remove('open'); $('mask').classList.remove('open'); };
+$('setBtn').onclick=openSheet; $('setClose').onclick=closeSheet; $('mask').onclick=closeSheet;
+$('importBtn').onclick=()=>$('fileIn').click();
+$('fileIn').onchange=e=>{ const f=e.target.files[0]; e.target.value=''; if(f){ closeSheet(); importPhoto(f); } };
+$('saveCurBtn').onclick=()=>{ closeSheet(); saveCurrent(); };
+$('delTplBtn').onclick=()=>{ closeSheet(); deleteCustom(); };
+$('shutter').onclick=()=>capture(false);
+$('thumbBtn').onclick=openGallery;
+$('galClose').onclick=()=>$('gallery').classList.remove('open');
+$('galSave').onclick=sharePhoto;
+$('galDel').onclick=()=>{ const p=S.photos.splice(S.galIdx,1)[0]; if(p) URL.revokeObjectURL(p.url);
+  S.galIdx=Math.min(S.galIdx,S.photos.length-1); $('thumbBtn').style.backgroundImage=S.photos[0]?`url(${S.photos[0].url})`:''; renderGallery(); };
+$('flipBtn').onclick=async()=>{
+  S.facing = S.facing==='user'?'environment':'user'; store.set('facing',S.facing);
+  try{ await startCamera(); toast(S.facing==='user'?'前置摄像头（自拍模式）':'后置摄像头'); }catch(e){ toast('切换失败：'+e.message); }
+};
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) try{speechSynthesis.cancel();}catch(e){} else if(S.running) requestWake(); });
+async function requestWake(){ try{ if('wakeLock' in navigator) S.wake=await navigator.wakeLock.request('screen'); }catch(e){} }
+
+$('startBtn').onclick=async()=>{
+  const btn=$('startBtn'), msg=$('loadMsg');
+  btn.disabled=true; Voice.unlock(); beep('tick');
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia) throw new Error('当前浏览器不支持摄像头。请用 HTTPS 链接在 Safari / Chrome 中打开');
+    msg.textContent='请求摄像头权限…';
+    await startCamera();
+    await loadModels(m=>msg.textContent=m);
+    $('start').style.display='none';
+    S.running=true; resize(); requestWake();
+    selectTpl(S.tplId);
+    loop();
+  }catch(e){
+    console.error(e);
+    msg.textContent = (e.name==='NotAllowedError'?'摄像头权限被拒绝，请在浏览器设置中允许后重试':'启动失败：'+(e.message||e));
+    btn.disabled=false;
+  }
+};
+
+syncUI();
+{ const t=curTpl(); $('tplName').textContent=t.name; $('tplSub').textContent=t.tip; }
+renderChips();
+window.__posecam = {S, evaluate, guidance, placeTemplate, allTemplates, capture};
+</script>
+</body>
+</html>
